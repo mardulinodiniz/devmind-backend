@@ -454,13 +454,13 @@ app.put('/api/admin/acessos/:usuarioId', autenticar, apenasAdmin, (req, res) => 
     });
 });
 
-app.post('/api/pagamentos/criar', autenticar, (req, res) => {
-    const { curso_id, plano } = req.body;
+app.post('/api/pagamentos/criar', autenticar, async (req, res) => {
+    const { curso_id, plano, telefone } = req.body;
     const usuarioId = req.usuario.id;
 
-    if (!curso_id || !plano) {
+    if (!curso_id || !plano || !telefone) {
         return res.status(400).json({
-            erro: 'curso_id e plano são obrigatórios'
+            erro: 'curso_id, plano e telefone são obrigatórios'
         });
     }
 
@@ -480,38 +480,73 @@ app.post('/api/pagamentos/criar', autenticar, (req, res) => {
 
     const referencia = `PAG-${Date.now()}-${usuarioId}`;
 
-    const sql = `
-        INSERT INTO pagamentos
-        (usuario_id, curso_id, plano, valor, moeda, status, referencia)
-        VALUES (?, ?, ?, ?, 'AOA', 'pendente', ?)
-    `;
+    try {
+        const respostaBitPay = await axios.post(
+            `${BITPAY_API_URL}/payment_intents`,
+            {
+                amount: valor,
+                currency: 'AOA',
+                payment_method: 'multicaixa_express',
+                customer: {
+                    mobile: telefone
+                },
+                merchant_reference: referencia
+            },
+            {
+                headers: {
+                    Authorization: `Bearer ${BITPAY_SECRET_KEY}`,
+                    'Idempotency-Key': referencia,
+                    'Content-Type': 'application/json'
+                }
+            }
+        );
 
-    db.query(
-        sql,
-        [usuarioId, curso_id, plano, valor, referencia],
-        (err, resultado) => {
-            if (err) {
-                console.error('Erro ao criar pagamento:', err);
+        const pagamentoBitPay = respostaBitPay.data;
 
-                return res.status(500).json({
-                    erro: 'Erro ao criar pedido de pagamento'
+        const sql = `
+            INSERT INTO pagamentos
+            (usuario_id, curso_id, plano, valor, moeda, status, referencia)
+            VALUES (?, ?, ?, ?, 'AOA', 'pendente', ?)
+        `;
+
+        db.query(
+            sql,
+            [usuarioId, curso_id, plano, valor, referencia],
+            (err, resultado) => {
+                if (err) {
+                    console.error('Erro ao salvar pagamento:', err);
+
+                    return res.status(500).json({
+                        erro: 'Pagamento criado no BitPay, mas não foi possível salvar no banco'
+                    });
+                }
+
+                res.status(201).json({
+                    mensagem: 'Pagamento criado com sucesso!',
+                    pagamento: {
+                        id: resultado.insertId,
+                        curso_id: Number(curso_id),
+                        plano,
+                        valor,
+                        moeda: 'AOA',
+                        status: 'pendente',
+                        referencia,
+                        bitpay: pagamentoBitPay
+                    }
                 });
             }
+        );
 
-            res.status(201).json({
-                mensagem: 'Pedido de pagamento criado com sucesso!',
-                pagamento: {
-                    id: resultado.insertId,
-                    curso_id: Number(curso_id),
-                    plano,
-                    valor,
-                    moeda: 'AOA',
-                    status: 'pendente',
-                    referencia
-                }
-            });
-        }
-    );
+    } catch (erro) {
+        console.error(
+            'Erro BitPay:',
+            erro.response?.data || erro.message
+        );
+
+        return res.status(500).json({
+            erro: 'Não foi possível criar o pagamento no BitPay'
+        });
+    }
 });
 
 app.put(
