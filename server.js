@@ -3,9 +3,15 @@ const db = require('./db');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
+const axios = require('axios');
+
 const autenticar = require('./middleware/authMiddleware');
 const apenasAdmin = require('./middleware/admin');
+
 const JWT_SECRET = 'minha_chave_secreta_plataforma';
+
+const BITPAY_API_URL = 'https://api-sandbox.bitpay.ao/v1';
+const BITPAY_SECRET_KEY = process.env.BITPAY_SECRET_KEY;
 
 const app = express();
 
