@@ -35,61 +35,263 @@ app.post('/api/webhooks/bitpay', (req, res) => {
             });
         }
 
-        const match = assinatura.match(/^t=(\d+),v1=([0-9a-f]+)$/);
+        const match = assinatura.match(/t=(\d+),v1=([0-9a-f]+)/);
 
-if (!match) {
-    return res.status(401).json({
-        erro: 'Formato de assinatura BitPay inválido'
-    });
-}
+        if (!match) {
+            return res.status(401).json({
+                erro: 'Formato de assinatura BitPay inválido'
+            });
+        }
 
-const timestamp = match[1];
-const assinaturaRecebida = match[2];
+        const timestamp = match[1];
+        const assinaturaRecebida = match[2];
 
-const idade = Math.abs(Date.now() / 1000 - Number(timestamp));
+        const idade = Math.abs(
+            Date.now() / 1000 - Number(timestamp)
+        );
 
-if (idade > 600) {
-    return res.status(401).json({
-        erro: 'Webhook BitPay expirado'
-    });
-}
+        if (idade > 600) {
+            return res.status(401).json({
+                erro: 'Webhook BitPay expirado'
+            });
+        }
 
-const assinaturaEsperada = crypto
-    .createHmac('sha256', BITPAY_WEBHOOK_SECRET)
-    .update(`${timestamp}.${req.rawBody}`)
-    .digest('hex');
+        const assinaturaEsperada = crypto
+            .createHmac('sha256', BITPAY_WEBHOOK_SECRET)
+            .update(`${timestamp}.${req.rawBody}`)
+            .digest('hex');
 
-const valido = crypto.timingSafeEqual(
-    Buffer.from(assinaturaEsperada),
-    Buffer.from(assinaturaRecebida)
-);
+        const valido =
+            assinaturaEsperada.length === assinaturaRecebida.length &&
+            crypto.timingSafeEqual(
+                Buffer.from(assinaturaEsperada),
+                Buffer.from(assinaturaRecebida)
+            );
 
-if (!valido) {
-    return res.status(401).json({
-        erro: 'Assinatura BitPay inválida'
-    });
-}
-        if (assinatura !== assinaturaEsperada) {
+        if (!valido) {
             return res.status(401).json({
                 erro: 'Assinatura BitPay inválida'
             });
         }
 
-        console.log('Webhook BitPay validado com sucesso!');
-        console.log(req.body);
+        const evento = req.body;
 
-        res.status(200).json({
+        console.log('Webhook BitPay validado:', evento);
+
+        const tipoEvento = evento.type || evento.event;
+        const pagamento = evento.data || evento.payment || evento;
+
+        /*
+         * Só pagamentos SUCCEEDED liberam acesso.
+         */
+        if (
+            tipoEvento === 'payment.succeeded' ||
+            pagamento.status === 'SUCCEEDED'
+        ) {
+            const referencia =
+                pagamento.merchant_reference ||
+                pagamento.merchantReference;
+
+            if (!referencia) {
+                console.error(
+                    'Webhook recebido sem merchant_reference'
+                );
+
+                return res.status(400).json({
+                    erro: 'merchant_reference não encontrado'
+                });
+            }
+
+            const sqlBuscar = `
+                SELECT *
+                FROM pagamentos
+                WHERE referencia = ?
+                LIMIT 1
+            `;
+
+            db.query(
+                sqlBuscar,
+                [referencia],
+                (erro, pagamentos) => {
+
+                    if (erro) {
+                        console.error(
+                            'Erro ao buscar pagamento:',
+                            erro
+                        );
+
+                        return res.status(500).json({
+                            erro: 'Erro ao consultar pagamento'
+                        });
+                    }
+
+                    if (pagamentos.length === 0) {
+                        console.error(
+                            'Pagamento não encontrado:',
+                            referencia
+                        );
+
+                        return res.status(404).json({
+                            erro: 'Pagamento não encontrado'
+                        });
+                    }
+
+                    const pagamentoDB = pagamentos[0];
+
+                    /*
+                     * Se já estiver pago, não processamos novamente.
+                     * Isso protege contra retries do webhook.
+                     */
+                    if (pagamentoDB.status === 'pago') {
+                        console.log(
+                            'Pagamento já processado:',
+                            referencia
+                        );
+
+                        return res.status(200).json({
+                            recebido: true,
+                            processado: false,
+                            mensagem: 'Pagamento já processado'
+                        });
+                    }
+
+                    let moduloMaximo;
+
+                    if (pagamentoDB.plano === 'parcial') {
+                        moduloMaximo = 9;
+                    } else if (
+                        pagamentoDB.plano === 'upgrade' ||
+                        pagamentoDB.plano === 'completo'
+                    ) {
+                        moduloMaximo = 15;
+                    } else {
+                        console.error(
+                            'Plano inválido:',
+                            pagamentoDB.plano
+                        );
+
+                        return res.status(400).json({
+                            erro: 'Plano de pagamento inválido'
+                        });
+                    }
+
+                    const sqlPagamento = `
+                        UPDATE pagamentos
+                        SET status = 'pago',
+                            data_pagamento = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                    `;
+
+                    db.query(
+                        sqlPagamento,
+                        [pagamentoDB.id],
+                        (erroPagamento) => {
+
+                            if (erroPagamento) {
+                                console.error(
+                                    'Erro ao atualizar pagamento:',
+                                    erroPagamento
+                                );
+
+                                return res.status(500).json({
+                                    erro: 'Erro ao confirmar pagamento'
+                                });
+                            }
+
+                            const sqlAcesso = `
+                                UPDATE acessos_cursos
+                                SET modulo_maximo = ?,
+                                    status = 'ativo'
+                                WHERE usuario_id = ?
+                                AND curso_id = ?
+                            `;
+
+                            db.query(
+                                sqlAcesso,
+                                [
+                                    moduloMaximo,
+                                    pagamentoDB.usuario_id,
+                                    pagamentoDB.curso_id
+                                ],
+                                (erroAcesso) => {
+
+                                    if (erroAcesso) {
+                                        console.error(
+                                            'Erro ao liberar acesso:',
+                                            erroAcesso
+                                        );
+
+                                        return res.status(500).json({
+                                            erro:
+                                                'Pagamento confirmado, mas não foi possível liberar o acesso'
+                                        });
+                                    }
+
+                                    console.log(
+                                        `Pagamento ${referencia} confirmado. ` +
+                                        `Acesso liberado até o módulo ${moduloMaximo}.`
+                                    );
+
+                                    return res.status(200).json({
+                                        recebido: true,
+                                        processado: true,
+                                        pagamento: 'pago',
+                                        modulo_maximo: moduloMaximo
+                                    });
+                                }
+                            );
+                        }
+                    );
+                }
+            );
+
+            return;
+        }
+
+        /*
+         * Pagamento falhou.
+         */
+        if (tipoEvento === 'payment.failed') {
+
+            const referencia =
+                pagamento.merchant_reference ||
+                pagamento.merchantReference;
+
+            if (referencia) {
+                const sql = `
+                    UPDATE pagamentos
+                    SET status = 'falhou'
+                    WHERE referencia = ?
+                    AND status <> 'pago'
+                `;
+
+                db.query(sql, [referencia], (erro) => {
+                    if (erro) {
+                        console.error(
+                            'Erro ao registrar pagamento falhado:',
+                            erro
+                        );
+                    }
+                });
+            }
+        }
+
+        return res.status(200).json({
             recebido: true
         });
 
     } catch (erro) {
-        console.error('Erro ao processar webhook BitPay:', erro);
+        console.error(
+            'Erro no webhook BitPay:',
+            erro
+        );
 
-        res.status(500).json({
+        return res.status(500).json({
             erro: 'Erro interno no webhook'
         });
     }
 });
+
 const PORT = process.env.PORT || 3000;
 
 // Rota inicial
