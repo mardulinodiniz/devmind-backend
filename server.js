@@ -4,6 +4,7 @@ const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const axios = require('axios');
+const crypto = require('crypto');
 
 const autenticar = require('./middleware/authMiddleware');
 const apenasAdmin = require('./middleware/admin');
@@ -12,6 +13,7 @@ const JWT_SECRET = 'minha_chave_secreta_plataforma';
 
 const BITPAY_API_URL = 'https://api-sandbox.bitpay.ao/v1';
 const BITPAY_SECRET_KEY = process.env.BITPAY_SECRET_KEY;
+const BITPAY_WEBHOOK_SECRET = process.env.BITPAY_WEBHOOK_SECRET;
 
 const app = express();
 
@@ -20,14 +22,43 @@ app.use(cors());
 app.use(express.json());
 
 app.post('/api/webhooks/bitpay', (req, res) => {
-    console.log('Webhook BitPay recebido:');
-    console.log(req.body);
+    try {
+        const assinatura = req.headers['bitpay-signature'];
 
-    res.status(200).json({
-        recebido: true
-    });
+        if (!assinatura) {
+            return res.status(401).json({
+                erro: 'Assinatura BitPay ausente'
+            });
+        }
+
+        const payload = JSON.stringify(req.body);
+
+        const assinaturaEsperada = crypto
+            .createHmac('sha256', BITPAY_WEBHOOK_SECRET)
+            .update(payload)
+            .digest('hex');
+
+        if (assinatura !== assinaturaEsperada) {
+            return res.status(401).json({
+                erro: 'Assinatura BitPay inválida'
+            });
+        }
+
+        console.log('Webhook BitPay validado com sucesso!');
+        console.log(req.body);
+
+        res.status(200).json({
+            recebido: true
+        });
+
+    } catch (erro) {
+        console.error('Erro ao processar webhook BitPay:', erro);
+
+        res.status(500).json({
+            erro: 'Erro interno no webhook'
+        });
+    }
 });
-
 const PORT = process.env.PORT || 3000;
 
 // Rota inicial
