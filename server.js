@@ -19,7 +19,11 @@ const app = express();
 
 app.use(cors());
 
-app.use(express.json());
+app.use(express.json({
+    verify: (req, res, buf) => {
+        req.rawBody = buf.toString('utf8');
+    }
+}));
 
 app.post('/api/webhooks/bitpay', (req, res) => {
     try {
@@ -31,13 +35,40 @@ app.post('/api/webhooks/bitpay', (req, res) => {
             });
         }
 
-        const payload = JSON.stringify(req.body);
+        const match = assinatura.match(/^t=(\d+),v1=([0-9a-f]+)$/);
 
-        const assinaturaEsperada = crypto
-            .createHmac('sha256', BITPAY_WEBHOOK_SECRET)
-            .update(payload)
-            .digest('hex');
+if (!match) {
+    return res.status(401).json({
+        erro: 'Formato de assinatura BitPay inválido'
+    });
+}
 
+const timestamp = match[1];
+const assinaturaRecebida = match[2];
+
+const idade = Math.abs(Date.now() / 1000 - Number(timestamp));
+
+if (idade > 600) {
+    return res.status(401).json({
+        erro: 'Webhook BitPay expirado'
+    });
+}
+
+const assinaturaEsperada = crypto
+    .createHmac('sha256', BITPAY_WEBHOOK_SECRET)
+    .update(`${timestamp}.${req.rawBody}`)
+    .digest('hex');
+
+const valido = crypto.timingSafeEqual(
+    Buffer.from(assinaturaEsperada),
+    Buffer.from(assinaturaRecebida)
+);
+
+if (!valido) {
+    return res.status(401).json({
+        erro: 'Assinatura BitPay inválida'
+    });
+}
         if (assinatura !== assinaturaEsperada) {
             return res.status(401).json({
                 erro: 'Assinatura BitPay inválida'
